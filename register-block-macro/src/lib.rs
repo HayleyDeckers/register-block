@@ -1,7 +1,7 @@
 //! Procedural macro to generate UART register block and accessors.
 use proc_macro::TokenStream;
-use quote::{format_ident, quote};
-use syn::{ItemStruct, Lit, parse_macro_input};
+use quote::quote;
+use syn::{parse_macro_input, ItemStruct, Lit};
 
 /// Attribute macro to generate register block and accessors for UART.
 #[proc_macro_attribute]
@@ -28,7 +28,6 @@ pub fn register_block(_attr: TokenStream, item: TokenStream) -> TokenStream {
         ).to_compile_error().into();
     }
 
-    // Define Access enum inside the macro function to avoid polluting user namespace
     #[allow(non_camel_case_types)]
     #[derive(Clone, Copy)]
     enum Access {
@@ -36,19 +35,18 @@ pub fn register_block(_attr: TokenStream, item: TokenStream) -> TokenStream {
         RO,
         WO,
         Clear,
+        RC,
     }
 
-    // Collect offsets and access types for overlap checking
-    let mut accessors = Vec::new();
     use std::collections::HashMap;
     let mut offset_map: HashMap<u32, Access> = HashMap::new();
+    let mut struct_fields = Vec::new();
     for field in fields {
         let field_name = &field.ident;
         let field_ty = &field.ty;
         let mut offset = None;
         let mut access = None;
         let mut doc_attrs = Vec::new();
-        // Parse doc and custom attributes for offset and access type
         for attr in &field.attrs {
             if attr.path().is_ident("doc") {
                 doc_attrs.push(attr);
@@ -68,9 +66,10 @@ pub fn register_block(_attr: TokenStream, item: TokenStream) -> TokenStream {
                                 "RW" => access = Some(Access::RW),
                                 "RO" => access = Some(Access::RO),
                                 "WO" => access = Some(Access::WO),
-                                "CLEAR" | "Clear" => access = Some(Access::Clear),
+                                "WC" => access = Some(Access::Clear),
+                                "RC" => access = Some(Access::RC),
                                 _ => panic!(
-                                    "Unknown access type: {}. Use RW, RO, WO, or Clear.",
+                                    "Unknown access type: {}. Use RW, RO, WO, WC, or RC.",
                                     val
                                 ),
                             }
@@ -90,7 +89,7 @@ pub fn register_block(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 if let Some(existing) = offset_map.get(&offset) {
                     match existing {
                         Access::WO | Access::Clear => {} // allowed
-                        Access::RW | Access::RO => {
+                        Access::RW | Access::RO | Access::RC => {
                             return syn::Error::new_spanned(
                                 field_name,
                                 format!("Duplicate register offset 0x{:X} for RO field {:?}. Only WO/Clear may overlap with RO.", offset, field_name)
@@ -99,74 +98,54 @@ pub fn register_block(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 }
             }
-            Access::RW | Access::WO | Access::Clear => {
+            Access::RW | Access::WO | Access::Clear | Access::RC => {
                 if let Some(existing) = offset_map.get(&offset) {
                     match existing {
                         Access::RO => {} // allowed
                         _ => {
                             return syn::Error::new_spanned(
                                 field_name,
-                                format!("Duplicate register offset 0x{:X} for RW/WO/Clear field {:?}. Only RO may overlap with RW/WO/Clear.", offset, field_name)
+                                format!("Duplicate register offset 0x{:X} for RW/WO/Clear/RC field {:?}. Only RO may overlap with RW/WO/Clear/RC.", offset, field_name)
                             ).to_compile_error().into();
                         }
                     }
                 }
             }
         }
-        // Record the offset and access type for future checks
         offset_map.insert(offset, access.clone());
-        // Generate accessors based on access type, propagating doc comments
-        let getter = match access {
-            Access::RW | Access::RO => {
-                let method = format_ident!("read_{}", field_name.as_ref().unwrap());
-                Some(quote! {
-                    #(#doc_attrs)*
-                    #[inline(always)]
-                    pub fn #method(&self) -> #field_ty {
-                        unsafe {
-                            ((self.base.base_address() as *const u8).add(#offset as usize) as *const #field_ty).read_volatile()
-                        }
-                    }
-                })
-            }
-            Access::WO | Access::Clear => None,
+        // Generate accessor function based on access type
+        let (ptr_type, init_expr) = match access {
+            Access::RW => (
+                quote! { ::register_block::RW<#field_ty> },
+                quote! { unsafe { ::register_block::RW::new(self.base.base_address() + #offset as usize) } },
+            ),
+            Access::RO => (
+                quote! { ::register_block::RO<#field_ty> },
+                quote! { unsafe { ::register_block::RO::new(self.base.base_address() + #offset as usize) } },
+            ),
+            Access::WO => (
+                quote! { ::register_block::WO<#field_ty> },
+                quote! { unsafe { ::register_block::WO::new(self.base.base_address() + #offset as usize) } },
+            ),
+            Access::Clear => (
+                quote! { ::register_block::WC<#field_ty> },
+                quote! { unsafe { ::register_block::WC::new(self.base.base_address() + #offset as usize) } },
+            ),
+            Access::RC => (
+                quote! { ::register_block::RC<#field_ty> },
+                quote! { unsafe { ::register_block::RC::new(self.base.base_address() + #offset as usize) } },
+            ),
         };
-        let setter = match access {
-            Access::RW | Access::WO => {
-                let method = format_ident!("write_{}", field_name.as_ref().unwrap());
-                Some(quote! {
-                    #(#doc_attrs)*
-                    #[inline(always)]
-                    pub fn #method(&self, value: #field_ty) {
-                        unsafe {
-                            ((self.base.base_address() as *mut u8).add(#offset as usize) as *mut #field_ty).write_volatile(value)
-                        }
-                    }
-                })
+        let accessor = quote! {
+            #(#doc_attrs)*
+            #[inline(always)]
+            pub fn #field_name(&self) -> #ptr_type {
+                #init_expr
             }
-            Access::Clear => {
-                let method = format_ident!("clear_{}", field_name.as_ref().unwrap());
-                Some(quote! {
-                    #(#doc_attrs)*
-                    #[inline(always)]
-                    pub fn #method(&self) {
-                        unsafe {
-                            ((self.base.base_address() as *mut u8).add(#offset as usize) as *mut #field_ty).write_volatile(Default::default())
-                        }
-                    }
-                })
-            }
-            Access::RO => None,
         };
-        if let Some(getter) = getter {
-            accessors.push(getter);
-        }
-        if let Some(setter) = setter {
-            accessors.push(setter);
-        }
+        struct_fields.push(accessor);
     }
 
-    // Add a base field of type T: BaseAddress and implement generics
     let expanded = quote! {
         pub struct #struct_name<T: ::register_block::BaseAddress> {
             base: T,
@@ -176,7 +155,7 @@ pub fn register_block(_attr: TokenStream, item: TokenStream) -> TokenStream {
             pub fn new(base: T) -> Self {
                 Self { base }
             }
-            #(#accessors)*
+            #(#struct_fields)*
         }
     };
     TokenStream::from(expanded)
