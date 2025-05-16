@@ -1,0 +1,7 @@
+[package]
+name = "register-block"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+register-block-macro = { path = "register-block-macro" }
